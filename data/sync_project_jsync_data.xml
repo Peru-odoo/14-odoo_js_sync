@@ -1,0 +1,1731 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- Copyright 2021 Pablo
+     License MIT (https://opensource.org/licenses/MIT). -->
+<odoo>
+  <record id="jsync_sync-project" model="sync.project">
+    <field name="name">JSYNC</field>
+    <field name="active" eval="True"/>
+    <field name="eval_context">http_endpoint</field>
+    <field name="common_code"><![CDATA[AUTO_REF = '%s_%s' % (task.project_id.name, task.name)
+
+def update_sync_link(action, record, link=False):
+  """
+  Update internal module links based on trigger
+
+  :param record: ORM Record
+  :param action: Trigger name as action
+  :param link: Actual record link
+  """
+  if action == 'create':
+    record.set_link(AUTO_REF, record.id)
+  elif action == 'delete':
+    record.search_links(AUTO_REF).unlink()
+  elif link:
+    link.update_links(record.write_date)
+
+def create_search(model_name, model_domain=[]):
+  """
+  Search model records not created
+
+  :param model_name: ORM Model name
+  :param filters: ORM Filter list (domain)
+  :return: Postgres recordset
+  """
+  records = env[model_name].search(model_domain)
+  return records.filtered(lambda x: not x.search_links(AUTO_REF))
+      
+def auto_records(model_name, model_domain=[], only_active=False):
+  """
+  Manage create/update/delete automatically based on internal links
+  
+  :param model_name: ORM Model name
+  :param model_domain: ORM Search domain list
+  :param only_active: Process only active records
+  """
+  model = env[model_name].with_context(active_test=only_active)
+  model_found_links = model.search_links(AUTO_REF)
+  notifiable_records = model.search(model_domain)
+  to_create = notifiable_records.filtered(lambda x: not x.search_links(AUTO_REF))
+
+  for record in to_create:
+    if send_record('create', record):
+      update_sync_link('create', record)
+
+  if model_found_links:
+    
+    to_delete = model.search([['id','not in', notifiable_records.ids]])
+    to_update = model.search([["write_date", ">", model_found_links.sync_date.strftime(DEFAULT_SERVER_DATETIME_FORMAT)]]) - to_delete
+    
+    for record in to_update:
+      link = record.search_links(AUTO_REF).ensure_one()
+      if link and record.write_date > link.sync_date and send_record('update', record):
+        update_sync_link('update', record, link)
+
+    for record in to_delete:
+      if send_record('delete', record):
+        update_sync_link('delete', record)
+
+def chunk_and_queue_records(job_method_name, recordset, chunk_size=100):
+  """
+  Chunk recordset and add a job for each part
+
+  :param job_method_name: Callback method
+  :param recordset: Postgres recordset
+  :param chunk_size: Num. of part records
+  """
+  num_parts = math.ceil(len(recordset)/chunk_size)
+  for x in range(0, num_parts):
+    start = x * limit
+    end = start + limit
+    part = list(recordset[start:end])
+    add_job(job_method_name)(part)
+
+def img_full_path(name):
+  """
+  Return full image path
+
+  :param name: Image name
+  :return: str
+  """
+  return '%s%s' % (params.IMAGES_BASE, name) if name else None # NULL
+
+def send_to_jsync(action, data):
+  """
+  Send JSON data using POST
+
+  :param action: CRUD method
+  :param data: Data dict or list
+  :return: bool
+  """
+  return http_request(
+    'POST', 
+    json=json.dumps({
+      'object': task.name,
+      'operation': action,
+      'data': data
+    }, default=str)
+  ).ok
+  
+def get_field_translations(record, field='name'):
+  """
+  Get field translations dict for active langs on all models
+
+  :param record: Postgres record
+  :param field: Field name string
+  :return: dict (ISO 639-1 + '-' + ISO 3166-1 Alpha-2)
+
+  Return example:
+  {
+      'en-EN': 'Test',
+      'es-ES': 'Prueba'
+  }
+  """
+  record.ensure_one()
+  translations = dict()
+  origin = record.with_context(lang='en_US')
+  field_name = ','.join([record._name, field])
+  for lang in env['res.lang'].search([('active', '=', True), ('code', '!=', 'es')]):
+    iso_639_1 = lang.code.replace('_', '-')
+    translations[iso_639_1] = origin[field] or None
+  env.cr.execute("SELECT lang, value FROM ir_translation WHERE name=%s AND res_id=%s", (field_name, record.id))
+  for lang_code, field_translation in record._cr.fetchall():
+    iso_639_1 = lang_code.replace('_', '-')
+    if iso_639_1 in translations:
+      translations[iso_639_1] = field_translation
+  return translations
+  
+def get_base64_report_pdf(record, report_name):
+  """
+  Get PDF document as base64 string
+  Based on: https://github.com/odoo/odoo/blob/14.0/addons/web/controllers/main.py
+
+  :param record: Postgres record
+  :param report_name: Report model and name string
+  :return: base64
+  """
+  record.ensure_one()
+  context = record.env.context.copy()
+  context.pop('lang', False)
+  report = env['ir.actions.report']._get_report_from_name(report_name)
+  pdf = report.with_context(context)._render_qweb_pdf([record.id])[0]
+  return b64encode(pdf).decode('UTF-8')
+
+def get_field_multicompany(record, field='name'):
+  """
+  Get values for multicompany fields
+
+  :param record: Postgres record
+  :param field: Field name string
+  :return: list of tuples (company, record_id)
+
+  Return example:
+  [
+      (res.company(5), 28),
+      (res.company(8), 12)
+  ]
+  """
+  record.ensure_one()
+  result = list()
+  res_id = '%s,%s' % (record._name, record.id)
+  for value in env['ir.property'].sudo().search([('name', '=', field), ('res_id', '=', res_id)]):
+      result_item = False
+      if value.type == 'many2one':
+          model, reg_id = value.value_reference.split(',')
+          result_item = int(record.env[model].browse(reg_id).id)
+      elif value.type == 'boolean':
+          result_item = bool(value.value_integer)
+      elif value.type == 'float':
+          result_item = int(value.value_integer)
+      elif value.type == 'text':
+          result_item = str(value.value_text)
+      elif value.type == 'binary':
+          result_item = value.value_binary
+      result.append((value.company_id, result_item))
+  return result]]></field>
+  </record>
+  <record id="url_project-parameter" model="sync.project.param">
+    <field name="key">URL</field>
+    <field name="value">http://192.168.1.207:9020/</field>
+    <field name="description"></field>
+    <field name="url" eval=""/>
+    <field name="project_id" ref="jsync_sync-project"/>
+  </record>
+  <record id="images-base_project-parameter" model="sync.project.param">
+    <field name="key">IMAGES_BASE</field>
+    <field name="value">http://b2b.grupojimsports.com/test_images/</field>
+    <field name="description"></field>
+    <field name="url" eval=""/>
+    <field name="project_id" ref="jsync_sync-project"/>
+  </record>
+  <record id="docs-after_project-parameter" model="sync.project.param">
+    <field name="key">DOCS_AFTER</field>
+    <field name="value">01/07/2020 01:00:00</field>
+    <field name="description"></field>
+    <field name="url" eval=""/>
+    <field name="project_id" ref="jsync_sync-project"/>
+  </record>
+  <record id="attribute_sync-task" model="sync.task">
+    <field name="name">attribute</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.attribute'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'name': get_field_translations(record, 'name'),
+      'type': 'color' if record.display_type == 'color' else 'select',
+      'sequence': record.sequence
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="attribute_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="attribute_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="attribute_sync-task"/>
+    <field name="model_id" ref="product.model_product_attribute"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="attribute_sync-task"/>
+    <field name="model_id" ref="product.model_product_attribute"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="attribute-value_sync-task" model="sync.task">
+    <field name="name">attribute_value</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.attribute.value'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'attribute_id': record.attribute_id.id,
+      'name': get_field_translations(record, 'name'),
+      'sequence': record.sequence,
+      'html_color': record.html_color,
+      'image_color': img_full_path(record.public_image_name)
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="attribute-value_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="attribute-value_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="attribute-value_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_attribute_value"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="attribute-value_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_attribute_value"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="brand_sync-task" model="sync.task">
+    <field name="name">brand</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.brand'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'name': record.name,
+      'description': get_field_translations(record, 'description'),
+      'image': img_full_path(record.public_image_name)
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="brand_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="brand_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="brand_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_brand"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="brand_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_brand"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="category_sync-task" model="sync.task">
+    <field name="name">category</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.tag'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'name': get_field_translations(record, 'name'),
+      'parent_id': record.parent_id.id if record.parent_id else None,
+      'image': img_full_path(record.public_image_name),
+      'sequence': record.sequence,
+      # Está activa y activa para la web (y la categoría padre también)
+      'active': bool(record.active and record.web and (not record.parent_id or (record.parent_id and record.parent_id.web)))
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="category_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="category_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="category_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_tag"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="category_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_tag"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="product_sync-task" model="sync.task">
+    <field name="name">product</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.template'
+MODEL_DOMAIN = [['active','=',True]]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'name': get_field_translations(record, 'name'),
+      'reference': record.default_code,
+      'ean13': record.barcode or None,
+      'category_id': record.tag_ids.ids,
+      # 'web_category_id': record.public_categ_ids.ids, 
+      'brand_id': record.brand_id.id if record.brand_id else None,
+      'description': get_field_translations(record, 'description'),
+      # 'origin_country': record.origin_country_id.name if self.origin_country_id else None,
+      'weight': float(record.weight),
+      # 'width': float(record.width),
+      # 'height': float(record.height),
+      # 'length': float(record.packaging_length),
+      # 'volume': float(record.volume),
+      'image': img_full_path(record.public_image_name),
+      'web': record.website_published
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="product_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product_sync-task"/>
+    <field name="model_id" ref="account.model_product_template"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product_sync-task"/>
+    <field name="model_id" ref="account.model_product_template"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="product-variant_sync-task" model="sync.task">
+    <field name="name">product_variant</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.product'
+MODEL_DOMAIN = [['active','=',True],['product_tmpl_id.active','=',True]]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'product_id': record.product_tmpl_id.id,
+      'reference': record.default_code,
+      'attribute_value': record.product_template_attribute_value_ids.ids,
+      'ean13': record.barcode or None,
+      'weight': float(record.weight),
+      # 'width': float(record.product_size_width),
+      # 'height': float(record.product_size_height),
+      # 'length': float(record.product_size_depth),
+      # 'volume': float(record.volume),
+      'default': bool(record.id == record.product_variant_id.id),
+      'web': record.product_tmpl_id.website_published and record.website_published
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="product-variant_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-variant_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-variant_sync-task"/>
+    <field name="model_id" ref="account.model_product_product"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-variant_sync-task"/>
+    <field name="model_id" ref="account.model_product_product"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="currency_sync-task" model="sync.task">
+    <field name="name">currency</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'res.currency'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'name': record.name,
+      'code': record.name,
+      'symbol': record.symbol,
+      'rate': record.rate
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="currency_sync-task"/>
+  </record>
+  <record id="update-every-1-days_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="currency_sync-task"/>
+    <field name="interval_number">1</field>
+    <field name="interval_type">days</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="currency_sync-task"/>
+    <field name="model_id" ref="account.model_res_currency"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="currency_sync-task"/>
+    <field name="model_id" ref="account.model_res_currency"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="product-image_sync-task" model="sync.task">
+    <field name="name">product_image</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.jsimage'
+MODEL_DOMAIN = [['active','=',True]]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'product_id': record.product_tmpl_id.id, 
+      'name': get_field_translations(record, 'name'), 
+      'image': img_full_path(record.public_image_name), 
+      'attributes': record.product_attributes_values.ids,
+      'sequence': record.sequence
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="product-image_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-image_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-image_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_jsimage"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-image_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_jsimage"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="pricelist_sync-task" model="sync.task">
+    <field name="name">pricelist</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.pricelist'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'name': record.name,
+      'currency_id': record.currency_id.id
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="pricelist_sync-task"/>
+  </record>
+  <record id="update-every-1-days_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="pricelist_sync-task"/>
+    <field name="interval_number">1</field>
+    <field name="interval_type">days</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="pricelist_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_pricelist"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="pricelist_sync-task"/>
+    <field name="model_id" ref="js_addons.model_product_pricelist"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="supply-plan_sync-task" model="sync.task">
+    <field name="name">supply_plan</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'stock.move'
+MODEL_DOMAIN = [
+  ['product_id.product_tmpl_id.website_published','=',True],
+  ['product_id.website_published','=',True],
+  ['picking_type_id.code','=',"incoming"],
+  ['group_id','!=',False]
+]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+        'company_id': record.company_id.id,
+        'order_id': record.purchase_line_id.order_id.id,
+        'product_id': record.product_id.product_tmpl_id.id,
+        'variant_id': record.product_id.id if record.product_id.product_template_attribute_value_ids else None,
+        'quantity': record.product_uom_qty,
+        'shipping_date': record.date_expected
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="supply-plan_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="supply-plan_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="supply-plan_sync-task"/>
+    <field name="model_id" ref="delivery.model_stock_move"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="supply-plan_sync-task"/>
+    <field name="model_id" ref="delivery.model_stock_move"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="customer_sync-task" model="sync.task">
+    <field name="name">customer</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'res.partner'
+MODEL_DOMAIN = [
+  ['active','=',True],
+  ['company_type','=','company'],
+  ['type','=','contact'],
+  ['ref','!=',False],
+  ['vip_web_access','!=',False],
+  ['customer_rank','>',0],
+  ['property_product_pricelist','!=',False],
+  ['property_product_pricelist','!=',1],
+  ['email','!=',False]
+]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'name': record.name,
+      'vat': record.vat or None,
+      'email': record.primary_email(),
+      'reference': record.ref,
+      'customer_pricelists': [tuple([x[0].id, x[1]]) for x in get_field_multicompany(record, 'property_product_pricelist')],
+      'companies': record.vip_web_access.ids
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="customer_sync-task"/>
+  </record>
+  <record id="update-every-30-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="customer_sync-task"/>
+    <field name="interval_number">30</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="customer_sync-task"/>
+    <field name="model_id" ref="account.model_res_partner"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="customer_sync-task"/>
+    <field name="model_id" ref="account.model_res_partner"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="customer-address_sync-task" model="sync.task">
+    <field name="name">customer_address</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'res.partner'
+MODEL_DOMAIN = [
+  ['active','=',True],
+  ['type','in',['invoice', 'delivery']],
+  ['comment','!=','DROPSHIPPING-WEB'],
+  # DOMINIO DE LA DIRECCIÓN PADRE
+  ['parent_id.active','=',True],
+  ['parent_id.company_type','=','company'],
+  ['parent_id.type','=','contact'],
+  ['parent_id.ref','!=',False],
+  ['parent_id.vip_web_access','!=',False],
+  ['parent_id.customer_rank','>',0],
+  ['parent_id.property_product_pricelist','!=',False],
+  ['parent_id.property_product_pricelist','!=',1],
+  ['parent_id.email','!=',False]
+]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'customer_id': record.commercial_partner_id.id, 
+      'name': record.name if record.name else record.commercial_partner_id.name, 
+      'street': record.street, 
+      'street2': record.street2 or None, 
+      'zip': record.zip, 
+      'city': record.city, 
+      'state': record.state_id.name if record.state_id else None, 
+      'country': record.country_id.code if record.country_id else 'ES', 
+      'type': record.type, 
+      'default': False
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="customer-address_sync-task"/>
+  </record>
+  <record id="update-every-30-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="customer-address_sync-task"/>
+    <field name="interval_number">30</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="customer-address_sync-task"/>
+    <field name="model_id" ref="account.model_res_partner"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="customer-address_sync-task"/>
+    <field name="model_id" ref="account.model_res_partner"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="invoice_sync-task" model="sync.task">
+    <field name="name">invoice</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'account.move'
+MODEL_DOMAIN = [
+  ['move_type','in',['out_invoice', 'out_refund']],
+  ['state','in',['open', 'paid']],
+  ['invoice_date','>',params.DOCS_AFTER],
+  # DOMINIO DE LA DIRECCIÓN PADRE
+  ['commercial_partner_id.active','=',True],
+  ['commercial_partner_id.company_type','=','company'],
+  ['commercial_partner_id.type','=','contact'],
+  ['commercial_partner_id.ref','!=',False],
+  ['commercial_partner_id.vip_web_access','!=',False],
+  ['commercial_partner_id.customer_rank','>',0],
+  ['commercial_partner_id.property_product_pricelist','!=',False],
+  ['commercial_partner_id.property_product_pricelist','!=',1],
+  ['commercial_partner_id.email','!=',False]
+]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+
+  if action != 'delete':
+    # Obtenemos la moneda y posición
+    currency = record.currency_id.symbol
+    position = record.currency_id.position
+    total = str(record.amount_total)
+    
+    data.update({ 
+      'customer_id': record.commercial_partner_id.id,
+      'company_id': record.company_id.id,
+      'name': record.name, 
+      'date': record.date_invoice, 
+      'total': total + currency if position == 'after' else currency + total, 
+      # 'pdf': get_base64_report_pdf(record, 'custom_documents.report_picking_grouped_invoice') <- ODOO 10
+      'pdf': get_base64_report_pdf(record, 'account.report_invoice')
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="invoice_sync-task"/>
+  </record>
+  <record id="update-every-30-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="invoice_sync-task"/>
+    <field name="interval_number">30</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="invoice_sync-task"/>
+    <field name="model_id" ref="account.model_account_move"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="invoice_sync-task"/>
+    <field name="model_id" ref="account.model_account_move"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="delivery-note_sync-task" model="sync.task">
+    <field name="name">delivery_note</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'stock.picking'
+MODEL_DOMAIN = [
+  '|',
+  ['picking_type_id.code','=','outgoing'],
+  ['picking_type_id.name','=','Dropship'],
+  '&',
+  ['sale_id','!=',False],
+  ['date_done','>',params.DOCS_AFTER],
+  ['state','=','done'],
+  # DOMINIO DEL PEDIDO
+  ['sale_id.date_order','>',params.DOCS_AFTER],
+  ['sale_id.state','not in',['draft', 'proforma']],
+]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+
+  if action != 'delete':
+    # Obtenemos la moneda y posición
+    currency = record.sale_id.pricelist_id.currency_id.symbol
+    position = record.sale_id.pricelist_id.currency_id.position
+    total = str(record.sale_id.amount_total)
+    
+    data.update({ 
+      'customer_id': record.sale_id.partner_id.commercial_partner_id.id,
+      'company_id': record.company_id.id,
+      'name': record.name,
+      'date': record.date_done, 
+      'total': total + currency if position == 'after' else currency + total, 
+      # 'pdf': get_base64_report_pdf(record, 'stock.report_deliveryslip'), <- ODOO 10
+      'pdf': get_base64_report_pdf(record, 'stock.report_picking'),
+      'seur_tracking': record.carrier_tracking_ref or None
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="delivery-note_sync-task"/>
+  </record>
+  <record id="update-every-30-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="delivery-note_sync-task"/>
+    <field name="interval_number">30</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="delivery-note_sync-task"/>
+    <field name="model_id" ref="delivery.model_stock_move"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="delivery-note_sync-task"/>
+    <field name="model_id" ref="delivery.model_stock_move"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="sale-order_sync-task" model="sync.task">
+    <field name="name">sale_order</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'sale.order'
+MODEL_DOMAIN = [
+  ['date_order','>',params.DOCS_AFTER],
+  ['state','not in',['draft', 'proforma']],
+  # DOMINIO DE LA DIRECCIÓN PADRE
+  ['partner_id.commercial_partner_id.active','=',True],
+  ['partner_id.commercial_partner_id.company_type','=','company'],
+  ['partner_id.commercial_partner_id.type','=','contact'],
+  ['partner_id.commercial_partner_id.ref','!=',False],
+  ['partner_id.commercial_partner_id.vip_web_access','!=',False],
+  ['partner_id.commercial_partner_id.customer_rank','>',0],
+  ['partner_id.commercial_partner_id.property_product_pricelist','!=',False],
+  ['partner_id.commercial_partner_id.property_product_pricelist','!=',1],
+  ['partner_id.commercial_partner_id.email','!=',False]
+]
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+
+  if action != 'delete':
+    # Obtenemos la moneda y posición
+    currency = record.currency_id.symbol
+    position = record.currency_id.position
+    total = str(record.amount_total)
+    
+    data.update({ 
+      'customer_id': record.partner_id.commercial_partner_id.id,
+      'company_id': record.company_id.id,
+      'name': record.name, 
+      'date': record.date_order, 
+      'total': total + currency if position == 'after' else currency + total,
+      'pdf': get_base64_report_pdf(record, 'sale.report_saleorder'),
+      'state': record.state
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)
+      
+# --- DATOS ENTRANTES POR WEBHOOK ---
+      
+def _prepare_address_fields(address):
+    orm_country = env['res.country'].with_context(lang='en_US')
+    orm_better_zip = env['res.better.zip'].with_context(lang='en_US')
+    
+    # Buscar país
+    res_country_id = orm_country.search([('name', 'ilike', address.get('country_id'))], limit=1).id
+    
+    # Buscar provincia por ciudad, CP y país
+    res_state_id = orm_better_zip.search([('country_id', '=', res_country_id), ('city', 'ilike', address.get('state_id')), ('name', 'ilike', address.get('zip'))], limit=1).state_id.id
+    
+    if not res_state_id:
+        # Buscar provincia por CP y país (menos restrictiva)
+        res_state_id = orm_better_zip.search([('country_id', '=', res_country_id), ('name', 'ilike', address.get('zip'))], limit=1).state_id.id
+    
+    if not res_state_id:
+        # Buscar provincia por ciudad y país (puede dar un CP erróneo ya que hay ciudades con muchos códigos postales)
+        res_state_id = orm_better_zip.search([('country_id', '=', res_country_id), ('city', 'ilike', address.get('state_id'))], limit=1).state_id.id
+    
+    address.update({
+        'comment': 'DROPSHIPPING-WEB',
+        'type': 'delivery',
+        'active': False,
+        'state_id': res_state_id,
+        'country_id': res_country_id
+    })
+    
+    return address
+    
+def _prepare_order_fields(company_id, order):
+    One2many_order_lines = list()
+    
+    # Obtener el cliente
+    client = env['res.partner'].browse(int(order.get('partner_id')))
+    
+    # Obtener id de dirección de facturación (si no es empresa la función address_get da error)
+    partner_invoice_id = client.address_get(['contact', 'invoice'])['invoice'] if client.is_company else client.id
+    
+    # Modificamos las líneas
+    if type(order.get('order_line')) is list:
+        for line in order['order_line']:
+            # Es necesario el nombre
+            product = env['product.product'].browse(int(line['variant_id'])) if line['variant_id'] else env['product.template'].browse(int(line['product_id']))
+            # Formamos la línea con la sintaxis del One2many
+            One2many_order_lines.append(tuple([0, 0, {
+                'product_id': product.id if line['variant_id'] else product.product_variant_id.id,
+                'product_uom_qty': float(line['quantity'])
+            }]))
+    
+    # Actualizar campos + datos extra
+    order.update({
+        'order_line': One2many_order_lines,
+        'company_id': company_id,
+        'partner_id': int(order.get('partner_id', client.id)),
+        'partner_invoice_id': partner_invoice_id,
+        'partner_shipping_id': int(order.get('partner_shipping_id', client.id)),
+        'pricelist_id': client.property_product_pricelist.id,
+        'picking_policy': 'direct',
+        'state': 'draft',
+        'chanel': 'web'
+    })
+
+    return order
+      
+def handle_webhook(httprequest):
+  message = json.loads(httprequest.data)
+  company_id = data.get('company_id', 1)
+  action = message.get('action')
+  data = message.get('data')
+
+  # Si recibimos la dirección de envío como un diccionario primero tenemos que crearla
+  if type(data.get('partner_shipping_id')) is dict:
+      parsed_address = _prepare_address_fields(data['partner_shipping_id'])
+      shippping_address = env['res.partner'].create(parsed_address)
+      if shippping_address:
+          data.update({
+              'partner_shipping_id': shippping_address.id,
+              'neutral_document': True
+          })
+      else:
+          log('ERROR CREANDO DIRECCIÓN PARA PEDIDO WEB...\n%s', parsed_address)
+  
+  # Realizamos la operación solicitada
+  parsed_data = _prepare_order_fields(company_id, data)
+  action_method = getattr(env['sale.order'], action, None)
+  if parsed_data and callable(action_method):
+    return item_action(parsed_data)
+  return False
+  ]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="sale-order_sync-task"/>
+  </record>
+  <record id="update-every-30-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="sale-order_sync-task"/>
+    <field name="interval_number">30</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="sale-order_sync-task"/>
+    <field name="model_id" ref="delivery.model_sale_order"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="sale-order_sync-task"/>
+    <field name="model_id" ref="delivery.model_sale_order"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="sale-order_webhook-trigger" model="sync.trigger.webhook">
+    <field name="trigger_name">sale.order</field>
+    <field name="active" eval="True"/>
+    <field name="name">Webhook</field>
+    <field name="sync_task_id" ref="sale-order_sync-task"/>
+    <field name="webhook_type">json</field>
+  </record>
+  <record id="translations_sync-task" model="sync.task">
+    <field name="name">translations</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[def handle_db(records):
+  for record in records:
+    if ',' in record.name:
+      record_model, record_field = record.name.split(',')
+      record = record.env[record_model].browse(record.res_id)
+      # Actualizar fecha de escritura en el registro afectado
+      record.write({'write_date': datetime.datetime.now()})]]></field>
+  </record>
+  <record id="create-update_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create_update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="translations_sync-task"/>
+    <field name="model_id" ref="base.model_ir_translation"/>
+    <field name="trigger">on_create_or_write</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="translations_sync-task"/>
+    <field name="model_id" ref="base.model_ir_translation"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="pricelist-item_sync-task" model="sync.task">
+    <field name="name">pricelist_item</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[def _pricelists_unique_quantities():
+  env.cr.execute("SELECT pricelist_id, \
+    CASE \
+        WHEN min_quantity > 0 THEN min_quantity \
+        ELSE 1 \
+    END min_qty \
+    FROM product_pricelist_item  \
+    WHERE pricelist_id IS NOT NULL  \
+    AND active = true \
+    GROUP BY pricelist_id, min_qty \
+    ORDER BY pricelist_id, min_qty")
+  return env.cr.fetchall()
+  
+def _products_in_pricelists():
+  env.cr.execute("SELECT product_tmpl_id \
+    FROM product_product \
+    WHERE id IN ( \
+        SELECT product_id FROM product_pricelist_item \
+        WHERE active = true \
+        GROUP BY product_id \
+    ) OR product_tmpl_id IN ( \
+        SELECT product_tmpl_id FROM product_pricelist_item \
+        WHERE active = true \
+        GROUP BY product_tmpl_id \
+    ) \
+    GROUP BY product_tmpl_id")
+  return tuple(r[0] for r in env.cr.fetchall())
+
+def _search_pricelist_quantities(quantities, pricelist_id):
+    unique_quantities = set()
+    for qty in quantities:
+      if qty[0] == pricelist_id:
+        unique_quantities.add(qty[1])
+    # Add 1 on quantities if not exists
+    if 1 not in unique_quantities:
+        unique_quantities.add(1)
+    # Return sorted tuple
+    return sorted(tuple(unique_quantities))
+    
+def _check_rule_is_on_list(prices, pricelist, product, variant, qty, price):
+  for x in prices:
+    if x['pricelist_id'] == pricelist and x['product_id'] == product and x['variant_id'] == variant and x['quantity'] == qty and x['price'] == price:
+      return True
+  return False
+
+def handle_cron():
+    # Out prices
+    prices = list()
+    # Get decimals number
+    prices_precision = env['decimal.precision'].precision_get('Product Price')
+
+    # All pricelists or filtered
+    pfilter = [('id', 'in', pricelists_filter)] if pricelists_filter else []
+    pricelists = tuple(env['product.pricelist'].search([
+      ['web', '=', True],
+      ['active', '=', True]
+    ] + pfilter).mapped(lambda p: (p.id, p.name, p.company_id.id)))
+    
+    # Search params, only published products by default
+    product_search_params = [('website_published', '=', True)]
+    
+    # Limit search to this products
+    product_ids = templates_filter or _products_in_pricelists()
+    product_search_params.append(('id', 'in', product_ids))
+    
+    # All filtered products ids
+    products_ids = tuple(env['product.template'].with_context(active_test=False).search(product_search_params, limit=test_limit).ids)
+    
+    # All quantities
+    quantities = _pricelists_unique_quantities()
+    
+    # Log info
+    total_pricelists = len(pricelists)
+    total_products = len(products_ids)
+    product_number = 0.0
+
+    log('# LISTAS DE PRECIOS: %s' % total_pricelists)
+    log('# PRODUCTOS: %s' % total_products)
+
+    try:
+
+      # For each product
+      for product_id in products_ids:
+        product_number += 1
+        percent = round((product_number / total_products) * 100, 1)
+        product = env['product.template'].browse(product_id)
+        
+        # print("--------------------------------------------------------------------")
+        # print(":: %s%% [%s] %s" % (percent, product.default_code, product.name))
+        # print("--------------------------------------------------------------------")
+        # print(":: %10s\t%10s\t%6s\t%8s" % ('PRICELIST', 'VARIANT', 'QTY', 'PRICE'))
+        
+        # For each pricelist
+        for pricelist in pricelists:
+
+          # Pricelist filter
+          all_or_this_pricelist = (not pricelists_filter or pricelists_filter[0] == pricelist[0])
+
+          # For each quantity
+          for min_qty in _search_pricelist_quantities(quantities, pricelist[0]):
+            
+            # Quantity filter
+            all_or_this_quantity = (not qty or qty == min_qty)
+
+            # Product in pricelist & qty context
+            product_in_ctx = product.with_context({ 'pricelist': pricelist[0], 'quantity': min_qty })
+            
+            # Get all variant prices
+            variants_prices = tuple(product_in_ctx.product_variant_ids.mapped('price'))
+
+            # A 18/19/20 variant_prices no siempre tiene un precio 
+            # si se da ese caso metemos 0
+            if not variants_prices:
+                variants_prices = tuple([round(0, prices_precision),])
+
+            # Same price in all variants
+            compare_with_first = list()
+            for x in variants_prices:
+              compare_with_first.append(x==variants_prices[0])
+            if all(compare_with_first):
+
+              # Get unique variant price (template price)
+              price = round(variants_prices[0], prices_precision)
+              
+              # Save if not in list yet and is not filtered or matches filter
+              if not _check_rule_is_on_list(prices, pricelist[0], product_id, None, 1, price) and all_or_this_pricelist and all_or_this_quantity:
+                # print(":: %10s\t%10s\t%6s\t%8s" % (pricelist[0], '-', min_qty, price))
+                prices.append({ 
+                  'company_id': pricelist[2] or None,
+                  'pricelist_id': pricelist[0],
+                  'product_id': product_id,
+                  'variant_id': None,
+                  'quantity': min_qty,
+                  'price': price
+                })
+
+            else:
+
+              # For each variant
+              for v in range(len(variants_prices)):
+                  
+                # Get variant ID
+                variant_id = product_in_ctx.product_variant_ids.ids[v]
+
+                # Variant filter
+                all_or_this_variant = (not variant or variant_id == variant)
+
+                # Get variant price
+                price = round(variants_prices[v], prices_precision)
+
+                # Save if not in list yet and is not filtered or matches filter
+                if not _check_rule_is_on_list(prices, pricelist[0], product_id, variant_id, 1, price) and all_or_this_pricelist and all_or_this_quantity and all_or_this_variant:
+                  # print(":: %10s\t%10s\t%6s\t%8s" % (pricelist[0], variant_id, min_qty, price))
+                  prices.append({ 
+                    'company_id': pricelist[2] or None,
+                    'pricelist_id': pricelist[0],
+                    'product_id': product_id,
+                    'variant_id': variant_id,
+                    'quantity': min_qty,
+                    'price': price
+                  })
+
+    except Exception as e:
+
+      log('ERROR EN EL BUCLE! %s' % e)
+
+    finally:
+
+      log('FIN!')
+
+    # Send to JSync
+    if prices: send_to_jsync('replace', prices)]]></field>
+  </record>
+  <record id="replace_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">replace</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="pricelist-item_sync-task"/>
+  </record>
+  <record id="replace-every-1-days_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">replace</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="pricelist-item_sync-task"/>
+    <field name="interval_number">1</field>
+    <field name="interval_type">days</field>
+  </record>
+  <record id="product-stock_sync-task" model="sync.task">
+    <field name="name">product_stock</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[def handle_cron():
+  stock = list()
+  
+  try:
+    send_all = bool(trigger == 'replace')
+    stock = env['exportxml.object'].compute_product_ids(all=send_all, inc=1000)
+  except Exception as e:
+    log('ERROR EN EL BUCLE! %s' % e)
+  finally:
+    log('FIN!')
+  
+  # Send to JSync
+  if stock: send_to_jsync('product_stock', stock)]]></field>
+  </record>
+  <record id="replace_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">replace</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="product-stock_sync-task"/>
+  </record>
+  <record id="replace-every-1-days_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">replace</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-stock_sync-task"/>
+    <field name="interval_number">1</field>
+    <field name="interval_type">days</field>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-stock_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="parameterization-field_sync-task" model="sync.task">
+    <field name="name">parameterization_field</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.feature'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data['name'] = get_field_translations(record, 'name')
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="parameterization-field_sync-task"/>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="parameterization-field_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_feature"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="update_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="parameterization-field_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_feature"/>
+    <field name="trigger">on_write</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="parameterization-field_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_feature"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="parameterization-value_sync-task" model="sync.task">
+    <field name="name">parameterization_value</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.feature.value'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {'jim_id': record.id}
+  
+  if action != 'delete':
+    data.update({
+      'field': record.feature_id.id,
+      'name': get_field_translations(record, 'name') 
+    })
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="parameterization-value_sync-task"/>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="parameterization-value_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_feature_value"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="update_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="parameterization-value_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_feature_value"/>
+    <field name="trigger">on_write</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="parameterization-value_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_feature_value"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+  <record id="product-parameterization_sync-task" model="sync.task">
+    <field name="name">product_parameterization</field>
+    <field name="active" eval="True"/>
+    <field name="project_id" ref="jsync_sync-project"/>
+    <field name="code"><![CDATA[MODEL_NAME = 'product.template.feature.line'
+MODEL_DOMAIN = []
+
+def send_record(action, record):
+  data = {
+    'jim_id': record.id,
+    'product_id': record.product_tmpl_id.id,
+    'feature_id': record.feature_id.id
+  }
+  
+  if action != 'delete':
+    data['value_ids'] = record.value_ids.ids
+    
+  return send_to_jsync(action, data)
+
+def handle_cron():
+  auto_records(MODEL_NAME, MODEL_DOMAIN)
+
+def handle_db(records):
+  for record in records:
+    if send_record(trigger, record):
+      update_sync_link(trigger, record)
+
+def handle_button():
+  for record in create_search(MODEL_NAME, MODEL_DOMAIN):
+    if send_record(action, record):
+      update_sync_link(action, record)]]></field>
+  </record>
+  <record id="create_manual-trigger" model="sync.trigger.button">
+    <field name="trigger_name">create</field>
+    <field name="name"></field>
+    <field name="sync_task_id" ref="product-parameterization_sync-task"/>
+  </record>
+  <record id="update-every-15-minutes_cron-trigger" model="sync.trigger.cron">
+    <field name="trigger_name">update</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-parameterization_sync-task"/>
+    <field name="interval_number">15</field>
+    <field name="interval_type">minutes</field>
+  </record>
+  <record id="create_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">create</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-parameterization_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_template_feature_line"/>
+    <field name="trigger">on_create</field>
+  </record>
+  <record id="delete_db-trigger" model="sync.trigger.automation">
+    <field name="trigger_name">delete</field>
+    <field name="active" eval="True"/>
+    <field name="sync_task_id" ref="product-parameterization_sync-task"/>
+    <field name="model_id" ref="js_product_features.model_product_template_feature_line"/>
+    <field name="trigger">on_unlink</field>
+  </record>
+</odoo>
